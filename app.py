@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
-import openpyxl
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from datetime import datetime, date
 import io
-import os
-import json
+import openpyxl
 
 # Configuração da Página (Responsiva para Desktop e Celular)
 st.set_page_config(
@@ -13,11 +15,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Diretório para salvar comprovantes (notas e boletos)
-UPLOAD_DIR = "comprovantes_digitais"
-DB_FILE = "dados_condominio.xlsx"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 CATEGORIAS = [
     "Recebimento de Taxas Condominiais",
@@ -38,34 +35,86 @@ AREAS_MANUTENCAO = [
     "Conservação & Segurança", "Áreas Comuns"
 ]
 
-# Funções de Carga e Persistência
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Conexão com Google Sheets e Google Drive via Secrets do Streamlit
+@st.cache_resource
+def conectar_google():
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    drive_service = build("drive", "v3", credentials=creds)
+    return gc, drive_service
+
 def carregar_dados():
-    if not os.path.exists(DB_FILE):
+    gc, _ = conectar_google()
+    sh = gc.open_by_key(st.secrets["PLANILHA_ID"])
+
+    ws_lan = sh.worksheet("Lancamentos")
+    vals_lan = ws_lan.get_all_values()
+    if len(vals_lan) > 4:
+        headers_lan = vals_lan[3]
+        df_lan = pd.DataFrame(vals_lan[4:], columns=headers_lan)
+        df_lan = df_lan[df_lan["ID"].astype(str).str.strip() != ""]
+        df_lan["Valor (R$)"] = (
+            df_lan["Valor (R$)"]
+            .astype(str)
+            .str.replace("R$", "", regex=False)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+            .str.strip()
+        )
+        df_lan["Valor (R$)"] = pd.to_numeric(df_lan["Valor (R$)"], errors="coerce").fillna(0.0)
+    else:
         df_lan = pd.DataFrame(columns=[
             "ID", "Data", "Competência", "Tipo", "Conta", "Categoria",
             "Fornecedor / Pagador", "Descrição Detalhada", "Valor (R$)",
             "Status Comprovante", "Nº NF / Doc", "Origem Registro", "Link Comprovante (Drive)"
         ])
+
+    ws_man = sh.worksheet("Historico_Manutencoes")
+    vals_man = ws_man.get_all_values()
+    if len(vals_man) > 3:
+        headers_man = vals_man[2]
+        df_man = pd.DataFrame(vals_man[3:], columns=headers_man)
+        df_man = df_man[df_man["ID Manut."].astype(str).str.strip() != ""]
+    else:
         df_man = pd.DataFrame(columns=[
             "ID Manut.", "Ano", "Mês / Competência", "Data Execução",
             "Serviço / Intervenção Realizada", "Área / Equipamento", "ID Despesa Vinculada"
         ])
-        return df_lan, df_man
 
-    df_lan = pd.read_excel(DB_FILE, sheet_name="Lancamentos", skiprows=3)
-    df_lan = df_lan.dropna(subset=["ID"])
-    df_man = pd.read_excel(DB_FILE, sheet_name="Historico_Manutencoes", skiprows=2)
-    df_man = df_man.dropna(subset=["ID Manut."])
     return df_lan, df_man
 
-def salvar_dados(df_lan, df_man):
-    with pd.ExcelWriter(DB_FILE, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-        df_lan.to_excel(writer, sheet_name="Lancamentos", startrow=3, index=False)
-        df_man.to_excel(writer, sheet_name="Historico_Manutencoes", startrow=2, index=False)
+def upload_comprovante_drive(arquivo, nome_arquivo):
+    _, drive_service = conectar_google()
+    pasta_id = st.secrets["PASTA_DRIVE_ID"]
+    file_metadata = {"name": nome_arquivo, "parents": [pasta_id]}
+    media = MediaIoBaseUpload(io.BytesIO(arquivo.getbuffer()), mimetype=arquivo.type, resumable=True)
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute()
+    return file.get("webViewLink")
+
+def adicionar_lancamento_sheets(nova_linha_lista):
+    gc, _ = conectar_google()
+    sh = gc.open_by_key(st.secrets["PLANILHA_ID"])
+    ws_lan = sh.worksheet("Lancamentos")
+    ws_lan.append_row(nova_linha_lista, value_input_option="USER_ENTERED")
+
+def adicionar_manutencao_sheets(nova_man_lista):
+    gc, _ = conectar_google()
+    sh = gc.open_by_key(st.secrets["PLANILHA_ID"])
+    ws_man = sh.worksheet("Historico_Manutencoes")
+    ws_man.append_row(nova_man_lista, value_input_option="USER_ENTERED")
 
 # Sidebar de Navegação
 st.sidebar.title("🏢 Gestão Condominial")
-st.sidebar.caption("Acesso Desktop, Mobile & WhatsApp IA")
+st.sidebar.caption("Integrado ao Google Sheets & Drive")
+
+if st.sidebar.button("🔄 Atualizar Dados"):
+    st.rerun()
 
 menu = st.sidebar.radio(
     "Navegação",
@@ -73,12 +122,16 @@ menu = st.sidebar.radio(
         "📊 Dashboard & Classificações",
         "➕ Novo Lançamento (Nota/Boleto)",
         "🔧 Histórico de Manutenções",
-        "📑 Relatório Administradora (Excel)",
-        "📂 Repositório Digital"
+        "📑 Relatório Administradora (Excel)"
     ]
 )
 
-df_lan, df_man = carregar_dados()
+try:
+    df_lan, df_man = carregar_dados()
+except Exception as e:
+    st.error(f"Erro ao conectar à planilha Google: {e}")
+    st.info("Verifique se os Secrets (gcp_service_account, PLANILHA_ID e PASTA_DRIVE_ID) foram configurados no Streamlit.")
+    st.stop()
 
 # ==============================================================================
 # TELA 1: DASHBOARD & CLASSIFICAÇÕES
@@ -100,7 +153,6 @@ if menu == "📊 Dashboard & Classificações":
     if cat_sel != "Todas":
         df_filt = df_filt[df_filt["Categoria"] == cat_sel]
 
-    # Indicadores Principais
     receitas = df_filt[df_filt["Tipo"] == "Receita"]["Valor (R$)"].sum()
     despesas_tot = df_filt[df_filt["Tipo"] == "Despesa"]["Valor (R$)"].sum()
     investimentos = df_filt[
@@ -139,15 +191,22 @@ if menu == "📊 Dashboard & Classificações":
                 hide_index=True
             )
 
-    st.subheader("Extrato Detalhado Filtrado")
-    st.dataframe(df_filt, use_container_width=True, hide_index=True)
+    st.subheader("Extrato Detalhado (com Links dos Comprovantes)")
+    st.dataframe(
+        df_filt,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Link Comprovante (Drive)": st.column_config.LinkColumn("Comprovante")
+        }
+    )
 
 # ==============================================================================
-# TELA 2: NOVO LANÇAMENTO (DESKTOP OU CÂMERA DO CELULAR)
+# TELA 2: NOVO LANÇAMENTO (DESKTOP OU CÂMERA DO CELULAR -> GOOGLE DRIVE)
 # ==============================================================================
 elif menu == "➕ Novo Lançamento (Nota/Boleto)":
     st.title("➕ Registrar Movimentação & Comprovante")
-    st.caption("No celular, toque em 'Browse files' para tirar foto direta da nota fiscal ou boleto.")
+    st.caption("Salva direto na Planilha Google e envia o comprovante para a pasta do Google Drive.")
 
     with st.form("form_lancamento", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
@@ -171,55 +230,52 @@ elif menu == "➕ Novo Lançamento (Nota/Boleto)":
         vincular_manut = st.checkbox("Registrar também no Histórico de Manutenções?")
         area_manut = st.selectbox("Área / Equipamento (se for manutenção)", AREAS_MANUTENCAO)
 
-        submitted = st.form_submit_button("💾 Salvar Lançamento", use_container_width=True)
+        submitted = st.form_submit_button("💾 Salvar na Nuvem", use_container_width=True)
 
         if submitted:
-            novo_id = f"LANC-{len(df_lan) + 1:03d}"
-            comp_str = dt_lanc.strftime("%Y-%m")
-            link_arquivo = "Pendente Upload"
+            with st.spinner("Salvando lançamento e enviando arquivo ao Google Drive..."):
+                novo_id = f"LANC-{len(df_lan) + 1:03d}"
+                comp_str = dt_lanc.strftime("%Y-%m")
+                link_arquivo = "Pendente Upload"
 
-            if arquivo is not None:
-                ext = arquivo.name.split(".")[-1]
-                nome_limpo = f"{dt_lanc.strftime('%Y-%m-%d')}_{fornecedor.replace(' ', '_')}_{novo_id}.{ext}"
-                caminho_salvo = os.path.join(UPLOAD_DIR, nome_limpo)
-                with open(caminho_salvo, "wb") as f:
-                    f.write(arquivo.getbuffer())
-                link_arquivo = caminho_salvo
-                status_comp = "OK (Anexado)"
+                if arquivo is not None:
+                    ext = arquivo.name.split(".")[-1]
+                    forn_limpo = fornecedor.strip().replace(" ", "_") if fornecedor else "SemFornecedor"
+                    nome_limpo = f"{dt_lanc.strftime('%Y-%m-%d')}_{forn_limpo}_{novo_id}.{ext}"
+                    link_arquivo = upload_comprovante_drive(arquivo, nome_limpo)
+                    status_comp = "OK (Anexado)"
 
-            nova_linha = pd.DataFrame([{
-                "ID": novo_id,
-                "Data": pd.to_datetime(dt_lanc),
-                "Competência": comp_str,
-                "Tipo": tipo,
-                "Conta": conta,
-                "Categoria": categoria,
-                "Fornecedor / Pagador": fornecedor,
-                "Descrição Detalhada": descricao,
-                "Valor (R$)": valor,
-                "Status Comprovante": status_comp,
-                "Nº NF / Doc": num_nf if num_nf else "-",
-                "Origem Registro": "App Web/Mobile",
-                "Link Comprovante (Drive)": link_arquivo
-            }])
+                nova_linha = [
+                    novo_id,
+                    dt_lanc.strftime("%d/%m/%Y"),
+                    comp_str,
+                    tipo,
+                    conta,
+                    categoria,
+                    fornecedor,
+                    descricao,
+                    valor,
+                    status_comp,
+                    num_nf if num_nf else "-",
+                    "App Web/Mobile",
+                    link_arquivo
+                ]
+                adicionar_lancamento_sheets(nova_linha)
 
-            df_lan = pd.concat([df_lan, nova_linha], ignore_index=True)
+                if vincular_manut:
+                    novo_man_id = f"MAN-{len(df_man) + 1:03d}"
+                    nova_man = [
+                        novo_man_id,
+                        dt_lanc.year,
+                        dt_lanc.strftime("%B/%Y"),
+                        dt_lanc.strftime("%d/%m/%Y"),
+                        f"{descricao} ({fornecedor})",
+                        area_manut,
+                        novo_id
+                    ]
+                    adicionar_manutencao_sheets(nova_man)
 
-            if vincular_manut:
-                novo_man_id = f"MAN-{len(df_man) + 1:03d}"
-                nova_man = pd.DataFrame([{
-                    "ID Manut.": novo_man_id,
-                    "Ano": dt_lanc.year,
-                    "Mês / Competência": dt_lanc.strftime("%B/%Y"),
-                    "Data Execução": pd.to_datetime(dt_lanc),
-                    "Serviço / Intervenção Realizada": f"{descricao} ({fornecedor})",
-                    "Área / Equipamento": area_manut,
-                    "ID Despesa Vinculada": novo_id
-                }])
-                df_man = pd.concat([df_man, nova_man], ignore_index=True)
-
-            salvar_dados(df_lan, df_man)
-            st.success(f"Lançamento {novo_id} registrado com sucesso!")
+                st.success(f"Lançamento {novo_id} gravado com sucesso no Google Sheets!")
 
 # ==============================================================================
 # TELA 3: HISTÓRICO DE MANUTENÇÕES (2022 - 2026+)
@@ -228,14 +284,14 @@ elif menu == "🔧 Histórico de Manutenções":
     st.title("🔧 Histórico de Manutenções & Garantias")
 
     c1, c2, c3 = st.columns(3)
-    anos = ["Todos"] + sorted(df_man["Ano"].dropna().astype(int).unique().tolist(), reverse=True)
+    anos = ["Todos"] + sorted(df_man["Ano"].astype(str).unique().tolist(), reverse=True)
     ano_sel = c1.selectbox("Ano", anos)
     area_sel = c2.selectbox("Área / Equipamento", ["Todas"] + AREAS_MANUTENCAO)
     busca = c3.text_input("Buscar serviço ou fornecedor", placeholder="Ex.: bomba, piscina, Otis, 1001...")
 
     df_m_filt = df_man.copy()
     if ano_sel != "Todos":
-        df_m_filt = df_m_filt[df_m_filt["Ano"] == ano_sel]
+        df_m_filt = df_m_filt[df_m_filt["Ano"].astype(str) == ano_sel]
     if area_sel != "Todas":
         df_m_filt = df_m_filt[df_m_filt["Área / Equipamento"] == area_sel]
     if busca:
@@ -251,35 +307,26 @@ elif menu == "🔧 Histórico de Manutenções":
 # ==============================================================================
 elif menu == "📑 Relatório Administradora (Excel)":
     st.title("📑 Fechamento Mensal para Administradora")
-    st.write("Gere e baixe a planilha Excel formatada pronta para enviar à administradora validar.")
+    st.write("Gere o arquivo Excel atualizado diretamente da base na nuvem para enviar à administradora.")
 
     competencias = sorted(df_lan["Competência"].astype(str).unique().tolist(), reverse=True)
     comp_export = st.selectbox("Selecione a Competência para Fechamento", competencias)
 
-    col_s1, col_s2 = st.columns(2)
-    saldo_ini_cc = col_s1.number_input("Saldo Inicial Conta Corrente (R$)", value=74688.25, format="%.2f")
-    saldo_ini_cx = col_s2.number_input("Saldo Inicial Conta Caixa (R$)", value=1.00, format="%.2f")
+    df_mes = df_lan[df_lan["Competência"].astype(str) == comp_export].copy()
+    st.subheader(f"Prévia dos Lançamentos — {comp_export}")
+    st.dataframe(df_mes, use_container_width=True, hide_index=True)
 
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "rb") as f:
-            st.download_button(
-                label=f"📥 Baixar Planilha Prestação de Contas ({comp_export}).xlsx",
-                data=f.read(),
-                file_name=f"Prestacao_Contas_Condominio_{comp_export}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+    # Gera arquivo Excel em memória com as abas atualizadas
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_mes.to_excel(writer, sheet_name=f"Prestacao_{comp_export}", index=False)
+        df_lan.to_excel(writer, sheet_name="Base_Completa_Lancamentos", index=False)
+        df_man.to_excel(writer, sheet_name="Historico_Manutencoes", index=False)
 
-# ==============================================================================
-# TELA 5: REPOSITÓRIO DIGITAL DE COMPROVANTES
-# ==============================================================================
-elif menu == "📂 Repositório Digital":
-    st.title("📂 Repositório de Notas Fiscais e Boletos")
-    arquivos = sorted(os.listdir(UPLOAD_DIR), reverse=True)
-    if not arquivos:
-        st.info("Nenhum comprovante digital enviado ainda pelo app. Os arquivos enviados aparecerão aqui organizados por data.")
-    else:
-        for arq in arquivos:
-            caminho = os.path.join(UPLOAD_DIR, arq)
-            with open(caminho, "rb") as f:
-                st.download_button(f"📄 {arq}", data=f.read(), file_name=arq)
+    st.download_button(
+        label=f"📥 Baixar Planilha Prestação de Contas ({comp_export}).xlsx",
+        data=output.getvalue(),
+        file_name=f"Prestacao_Contas_Condominio_{comp_export}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
